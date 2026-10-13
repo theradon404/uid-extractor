@@ -263,6 +263,104 @@ def extract_image(image, source):
         rows.append({"Name": player_name, "UID": uid, "Source": source})
     return rows, method_note
 
+
+def process_upload(upload):
+    """Return UID detections, per-page OCR statuses, and downloadable artifacts for problematic pages."""
+    data = upload.getvalue()
+    results, report, issue_files = [], [], {}
+
+    if upload.name.lower().endswith(".pdf"):
+        try:
+            document = fitz.open(stream=data, filetype="pdf")
+        except Exception as exc:
+            report.append({
+                "File / page": upload.name,
+                "Result": f"Could not open PDF: {exc}",
+                "UIDs found": "",
+            })
+            issue_files[upload.name] = (upload.name, data)
+            return results, report, issue_files
+
+        if document.page_count > 40:
+            report.append({
+                "File / page": upload.name,
+                "Result": "Not processed: PDF has more than 40 pages. Split into smaller PDFs.",
+                "UIDs found": "",
+            })
+            issue_files[upload.name] = (upload.name, data)
+            return results, report, issue_files
+
+        base_name = upload.name.rsplit(".", 1)[0]
+        for page_index, page in enumerate(document):
+            source = f"{upload.name} — page {page_index + 1}"
+            page_png = None
+            try:
+                pixmap = page.get_pixmap(matrix=fitz.Matrix(2.3, 2.3), alpha=False)
+                page_png = pixmap.tobytes("png")
+                image = Image.open(io.BytesIO(page_png))
+                page_rows, ocr_note = extract_image(image, source)
+                results.extend(page_rows)
+                found = ", ".join(row["UID"] for row in page_rows)
+                report.append({
+                    "File / page": source,
+                    "Result": (
+                        f"Found {len(page_rows)} UID(s) — {ocr_note}"
+                        if page_rows
+                        else ocr_note
+                    ),
+                    "UIDs found": found,
+                })
+                if not page_rows:
+                    issue_suffix = (
+                        "ambiguous"
+                        if ocr_note.startswith("Ambiguous fallback")
+                        else "no_uid"
+                    )
+                    issue_files[source] = (
+                        f"{base_name}_page_{page_index + 1:03d}_{issue_suffix}.png",
+                        page_png,
+                    )
+            except Exception as exc:
+                report.append({
+                    "File / page": source,
+                    "Result": f"OCR error: {exc}",
+                    "UIDs found": "",
+                })
+                if page_png:
+                    issue_files[source] = (
+                        f"{base_name}_page_{page_index + 1:03d}_ocr_error.png",
+                        page_png,
+                    )
+                else:
+                    # If the page cannot be rendered, preserve the original PDF for inspection.
+                    issue_files[source] = (upload.name, data)
+    else:
+        source = upload.name
+        try:
+            image = Image.open(io.BytesIO(data))
+            rows, ocr_note = extract_image(image, source)
+            results.extend(rows)
+            report.append({
+                "File / page": source,
+                "Result": (
+                    f"Found {len(rows)} UID(s) — {ocr_note}"
+                    if rows
+                    else ocr_note
+                ),
+                "UIDs found": ", ".join(row["UID"] for row in rows),
+            })
+            if not rows:
+                issue_files[source] = (upload.name, data)
+        except Exception as exc:
+            report.append({
+                "File / page": source,
+                "Result": f"Could not read/OCR image: {exc}",
+                "UIDs found": "",
+            })
+            issue_files[source] = (upload.name, data)
+
+    return results, report, issue_files
+
 def build_issue_zip(issue_rows, issue_files):
     """Create a ZIP containing only the images/files listed in the no-UID or OCR-error report."""
     buffer = io.BytesIO()
