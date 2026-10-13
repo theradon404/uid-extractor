@@ -1,77 +1,75 @@
 # UID Extractor
 
-Private Streamlit app to extract player names and 8-digit UIDs from game profile screenshots and PDFs, review/edit the results, and save approved entries to a private Google Sheet.
+Public Streamlit app for extracting player names and 8-digit UIDs from game profile screenshots and PDF pages, reviewing/editing them, and submitting them to a Google Sheets review queue. The site owner approves pending entries into the main UID database using an admin password.
 
 ## Features
 
-- Google sign-in plus an explicit email allowlist
+- Public upload page; no Google sign-in required
 - Multiple image and PDF uploads
 - Tesseract OCR
-- Editable review table before saving
-- Duplicate detection against the existing sheet and current upload batch
-- Append approved entries with submitter and UTC timestamp
+- Editable review table and CSV download
+- Public submissions go to a `Pending` worksheet, not directly to the main UID database
+- Password-protected admin review and approval into `UIDs`
+- Deduplication against the current queue and main database during admin approval
 
-## 1. Create a Google Sheet
+## 1. Prepare your Google Sheet
 
-Create a spreadsheet with a worksheet named `UIDs`. Its first row must be:
+Create a spreadsheet and add a worksheet named `UIDs` with the first row:
 
 `Name | UID | SubmittedBy | SubmittedAt`
+
+The app will create a second worksheet named `Pending` automatically with headers:
+
+`Name | UID | Source | SubmittedAt | Status`
 
 Copy the spreadsheet ID from the URL.
 
 ## 2. Configure Google Sheets access
 
 1. In Google Cloud Console, create/select a project and enable the Google Sheets API.
-2. Create a service account and a JSON key.
+2. Create a service account and download its JSON key.
 3. Share the spreadsheet with the service account's `client_email`, granting Editor access.
-4. Keep the key private. Put the service account fields in Streamlit secrets.
+4. Keep the JSON key private. Never commit it to GitHub or paste it into chat.
 
-## 3. Configure Google login
+## 3. Deploy to Streamlit Community Cloud
 
-Follow the Streamlit guide: https://docs.streamlit.io/develop/tutorials/authentication/google
+1. Deploy this repository with `app.py` as the main file.
+2. In app settings, open **Secrets** and add the following values:
+   - `spreadsheet_id`: your spreadsheet ID
+   - `worksheet_name`: `UIDs`
+   - `admin_password`: a long random private password only you know
+   - `gcp_service_account_json`: the entire downloaded service-account JSON, as a multi-line TOML triple-quoted string
+3. Save Secrets and restart the app.
+4. In the app's **Sharing** settings, choose **This app is public and searchable** if you want anyone with the link to access it.
 
-Create an OAuth web client and add these authorized redirect URIs:
-- Local: `http://localhost:8501/oauth2callback`
-- Deployed: `https://YOUR-APP-NAME.streamlit.app/oauth2callback`
+## 4. Public versus admin access
 
-Add permitted email addresses to the root-level `allowed_emails` list in secrets. If the OAuth consent screen is in Testing mode, add these accounts as Google test users too.
+- Anyone can upload images/PDFs, correct extracted names/UIDs, download CSV, and submit records for review.
+- Public visitors cannot add records directly to the main UID list. Submissions go to the `Pending` worksheet.
+- The site owner opens **Site owner: review submissions** in the app and enters the private `admin_password` to approve entries into `UIDs`.
+- Keep the Google Sheet private and share it only with your account and the service account.
 
-## 4. Run locally on Windows
+## OCR and usage notes
 
-Install Python 3.11. Install Tesseract OCR for Windows and ensure `tesseract.exe` is on PATH: https://github.com/UB-Mannheim/tesseract/wiki
+- OCR can misread decorative player names and digits. Review every result before submitting.
+- The OCR finds any standalone 8-digit number, so tune it if screenshots contain unrelated eight-digit numbers.
+- Names are guessed from nearby OCR text and may need correction.
+- PDFs are capped at 40 pages per file and each upload is limited to 15 MB to help avoid exhausting free hosting resources.
+- Public submissions may still be spammed. Review the Pending tab regularly and use a strong admin password.
+- Files are processed in memory by this app and are not intentionally saved as files. Hosting providers may retain operational logs under their own policies.
 
-In PowerShell, from the project folder:
+## Local setup
+
+Install Python 3.11 and Tesseract OCR for Windows. Ensure `tesseract.exe` is on PATH:
+https://github.com/UB-Mannheim/tesseract/wiki
 
 ```powershell
 py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-Copy-Item .streamlit\secrets.example.toml .streamlit\secrets.toml
-```
-
-Edit `.streamlit/secrets.toml` with real credentials, then run:
-
-```powershell
 streamlit run app.py
 ```
 
-## 5. Deploy to Streamlit Community Cloud
+Local secrets are configured with `.streamlit/secrets.toml`; see `.streamlit/secrets.example.toml` for the format. Never commit your real secrets file.
 
-1. Create a private GitHub repository.
-2. Commit `app.py`, `requirements.txt`, `packages.txt`, `.gitignore`, `README.md`, and the example secrets template. Never commit `.streamlit/secrets.toml`.
-3. Open https://share.streamlit.io/ and deploy the repository with `app.py` as the entry point.
-4. In app settings, open **Secrets** and paste your configured TOML secrets.
-5. Add the deployed URL plus `/oauth2callback` to the Google OAuth client's authorized redirect URIs.
-6. Restart and test sign-in, image upload, PDF upload, duplicate checking, and saving.
-
-Streamlit Community Cloud installs Linux system packages listed in `packages.txt`, including Tesseract here.
-
-## Important limitations
-
-- OCR may misread decorative names or digits. Always review results before saving.
-- The extractor looks for any standalone 8-digit number, so it may need tuning if the screenshot has unrelated 8-digit numbers.
-- Name extraction guesses from nearby OCR lines; correct names in the review table.
-- Community Cloud has resource and usage limits. Start with smaller PDF batches.
-- Uploaded files are processed in memory by this app and are not intentionally saved to disk. Hosting providers may still have operational logs or retention policies.
-- Keep the spreadsheet private and share it only with your account and the service account.
-- This is a starter implementation, not a security audit. Never expose OAuth or service-account secrets.
+This is a starter project, not a security audit. Keep credentials private, review submissions, and update dependencies periodically.
