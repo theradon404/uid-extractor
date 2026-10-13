@@ -2,7 +2,6 @@ import hashlib
 import io
 import json
 import re
-from datetime import datetime, timezone
 
 import fitz
 import gspread
@@ -19,48 +18,47 @@ st.caption("Upload game profile screenshots or PDFs. The app extracts names and 
 UID_RE = re.compile(r"(?<!\d)(\d{8})(?!\d)")
 IGNORED_NAMES = {
     "uid", "id", "level", "lvl", "profile", "player profile", "copy",
-    "server", "guild", "rank", "power", "close"
+    "server", "guild", "rank", "power", "close",
 }
-SHEET_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 
 @st.cache_resource
 def get_sheets_client():
     credentials = Credentials.from_service_account_info(
         json.loads(st.secrets["gcp_service_account_json"]),
-        scopes=SHEET_SCOPES,
+        scopes=["https://www.googleapis.com/auth/spreadsheets"],
     )
     return gspread.authorize(credentials)
 
 
 def get_worksheet():
-    """Main UID database. Public users may append validated entries here."""
     spreadsheet = get_sheets_client().open_by_key(st.secrets["spreadsheet_id"])
     worksheet_name = st.secrets.get("worksheet_name", "UIDs")
     try:
         worksheet = spreadsheet.worksheet(worksheet_name)
     except gspread.WorksheetNotFound:
-        worksheet = spreadsheet.add_worksheet(title=worksheet_name, rows=1000, cols=4)
-        worksheet.append_row(["Name", "UID", "SubmittedBy", "SubmittedAt"])
+        worksheet = spreadsheet.add_worksheet(title=worksheet_name, rows=1000, cols=2)
+        worksheet.append_row(["Name", "UID"])
+
     values = worksheet.get_all_values()
     if not values:
-        worksheet.append_row(["Name", "UID", "SubmittedBy", "SubmittedAt"])
+        worksheet.append_row(["Name", "UID"])
     elif values[0][:2] != ["Name", "UID"]:
         raise ValueError(
-            f'The first row of "{worksheet_name}" must begin with Name, UID. '
-            "Expected headers: Name, UID, SubmittedBy, SubmittedAt."
+            f'The first two cells in "{worksheet_name}" must be Name and UID. '
+            "Please set A1 to Name and B1 to UID."
         )
     return worksheet
 
 
-def existing_uids(worksheet):
-    uids = set()
+def get_existing_uids(worksheet):
+    existing = set()
     for row in worksheet.get_all_values()[1:]:
         if len(row) > 1:
             match = UID_RE.search(str(row[1]))
             if match:
-                uids.add(match.group(1))
-    return uids
+                existing.add(match.group(1))
+    return existing
 
 
 def preprocess_image(image):
@@ -81,7 +79,7 @@ def looks_like_name(line):
     return sum(char.isdigit() for char in cleaned) <= 3
 
 
-def extract_image(image, source):
+def extract_image(image):
     text = pytesseract.image_to_string(preprocess_image(image), config="--psm 6")
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     results, seen = [], set()
@@ -92,34 +90,27 @@ def extract_image(image, source):
                 continue
             seen.add(uid)
             player_name = ""
-            # Guess the username from the nearest plausible OCR line.
             for neighbor in (index - 1, index + 1, index - 2, index + 2):
                 if 0 <= neighbor < len(lines) and looks_like_name(lines[neighbor]):
                     player_name = re.sub(r"\s+", " ", lines[neighbor]).strip()
                     break
-            results.append({
-                "Name": player_name,
-                "UID": uid,
-                "Source": source,
-                "Submit": True,
-            })
+            results.append({"Name": player_name, "UID": uid})
     return results
 
 
 def process_upload(upload):
-    file_data = upload.getvalue()
+    data = upload.getvalue()
     results = []
     if upload.name.lower().endswith(".pdf"):
-        document = fitz.open(stream=file_data, filetype="pdf")
+        document = fitz.open(stream=data, filetype="pdf")
         if document.page_count > 40:
             raise ValueError("PDF has more than 40 pages. Please split it into smaller files.")
-        for page_index, page in enumerate(document):
+        for page in document:
             pixmap = page.get_pixmap(matrix=fitz.Matrix(2.3, 2.3), alpha=False)
             image = Image.open(io.BytesIO(pixmap.tobytes("png")))
-            results.extend(extract_image(image, f"{upload.name} — page {page_index + 1}"))
+            results.extend(extract_image(image))
     else:
-        image = Image.open(io.BytesIO(file_data))
-        results.extend(extract_image(image, upload.name))
+        results.extend(extract_image(Image.open(io.BytesIO(data))))
     return results
 
 
@@ -128,7 +119,7 @@ uploads = st.file_uploader(
     "Choose one or more files",
     type=["png", "jpg", "jpeg", "webp", "pdf"],
     accept_multiple_files=True,
-    help="Extraction starts automatically after you choose files. PDF files are processed page by page.",
+    help="OCR starts automatically after you choose files. PDF files are processed page by page.",
     max_upload_size=15,
 )
 
@@ -150,7 +141,7 @@ elif st.session_state.processed_signature is not None:
     st.session_state.review_data = None
     st.session_state.submit_notice = None
 
-# OCR runs automatically once whenever the selected file set changes.
+# Run OCR once when the selected files change.
 if uploads and current_signature != st.session_state.processed_signature:
     extracted = []
     with st.spinner("Reading images and PDF pages..."):
@@ -160,15 +151,14 @@ if uploads and current_signature != st.session_state.processed_signature:
             except Exception as exc:
                 st.warning(f"Could not process {upload.name}: {exc}")
 
-    unique_rows, seen_batch = [], set()
+    # Deduplicate UID values across all uploaded files, preserving first occurrence.
+    unique_rows, seen = [], set()
     for row in extracted:
-        if row["UID"] not in seen_batch:
-            seen_batch.add(row["UID"])
+        if row["UID"] not in seen:
+            seen.add(row["UID"])
             unique_rows.append(row)
 
-    st.session_state.review_data = pd.DataFrame(
-        unique_rows, columns=["Name", "UID", "Source", "Submit"]
-    )
+    st.session_state.review_data = pd.DataFrame(unique_rows, columns=["Name", "UID"])
     st.session_state.processed_signature = current_signature
     st.session_state.submit_notice = None
 
@@ -180,113 +170,97 @@ if st.session_state.submit_notice:
         st.warning(message)
 
 if uploads and st.session_state.review_data is not None:
-    st.subheader("2. Select the UIDs to submit")
+    st.subheader("2. Review all extracted entries")
     if st.session_state.review_data.empty:
         st.warning("No 8-digit UIDs were detected. Try a clearer screenshot or crop the profile area.")
     else:
         try:
             worksheet = get_worksheet()
-            known_uids = existing_uids(worksheet)
-            sheet_error = None
+            known_uids = get_existing_uids(worksheet)
         except Exception as exc:
             worksheet = None
             known_uids = set()
-            sheet_error = str(exc)
             st.error(
-                "Could not connect to the main UID database. Check the Streamlit Secrets "
-                "for the spreadsheet ID and service-account JSON."
+                "Could not connect to the UID database. Check spreadsheet_id and "
+                "gcp_service_account_json in Streamlit Secrets. Details: " + str(exc)
             )
 
-        review = st.session_state.review_data.copy()
+        review = st.session_state.review_data[["Name", "UID"]].copy()
+        review["Name"] = review["Name"].astype(str).str.strip()
         review["UID"] = review["UID"].astype(str).str.strip()
-        review["Already in database"] = review["UID"].isin(known_uids)
-        review["Repeated in upload"] = review["UID"].duplicated(keep="first")
-        review.loc[
-            review["Already in database"] | review["Repeated in upload"], "Submit"
-        ] = False
+        already_count = sum(uid in known_uids for uid in review["UID"])
 
         st.write(
             f"Found **{len(review)}** unique UID(s). "
-            f"Already in the database: **{int(review['Already in database'].sum())}**."
+            f"Already in the database: **{already_count}**."
         )
         st.caption(
-            "Correct any names or UIDs, then tick Submit for the entries you want to add. "
-            "Only selected, valid, new UIDs will be saved."
+            "All new, valid entries in this table will be submitted together. "
+            "You can correct a name or UID before submitting."
         )
 
         edited = st.data_editor(
             review,
             use_container_width=True,
             hide_index=True,
-            num_rows="dynamic",
+            num_rows="fixed",
             column_config={
-                "Name": st.column_config.TextColumn("Player name"),
-                "UID": st.column_config.TextColumn("8-digit UID", help="Must be exactly 8 digits."),
-                "Source": st.column_config.TextColumn("Source file/page", disabled=True),
-                "Submit": st.column_config.CheckboxColumn("Submit"),
-                "Already in database": st.column_config.CheckboxColumn("Already in database", disabled=True),
-                "Repeated in upload": st.column_config.CheckboxColumn("Repeated in upload", disabled=True),
+                "Name": st.column_config.TextColumn("Name"),
+                "UID": st.column_config.TextColumn("UID", help="Must be exactly 8 digits."),
             },
-            disabled=["Source", "Already in database", "Repeated in upload"],
             key="uid_review_editor",
         )
 
         st.download_button(
-            "Download reviewed entries as CSV",
+            "Download extracted entries as CSV",
             data=edited[["Name", "UID"]].to_csv(index=False).encode("utf-8-sig"),
             file_name="uid_extraction.csv",
             mime="text/csv",
         )
 
-        if st.button(
-            "Submit selected UIDs to database",
-            type="primary",
-            disabled=worksheet is None,
-        ):
-            selected, errors = [], []
+        if st.button("Submit all new UIDs to database", type="primary", disabled=worksheet is None):
+            rows_to_save, errors = [], []
+            # Re-read the database immediately before writing to reduce duplicate races.
+            known_uids = get_existing_uids(worksheet)
+            batch_seen = set()
+
             for _, row in edited.iterrows():
-                if not bool(row.get("Submit", False)):
-                    continue
                 name = str(row.get("Name", "")).strip()
                 uid = re.sub(r"\s+", "", str(row.get("UID", "")).strip())
+
                 if not re.fullmatch(r"\d{8}", uid):
                     errors.append(f"{uid or '(blank UID)'}: UID must be exactly 8 digits.")
                 elif not name:
-                    errors.append(f"{uid}: player name is blank.")
-                elif uid in known_uids:
+                    errors.append(f"{uid}: name is blank.")
+                elif uid in known_uids or uid in batch_seen:
                     continue
                 else:
-                    selected.append([
-                        name,
-                        uid,
-                        "Public submission",
-                        datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                    ])
-                    known_uids.add(uid)
+                    # Write exactly two values per row: Name and UID.
+                    rows_to_save.append([name, uid])
+                    batch_seen.add(uid)
 
             if errors:
                 st.error("Fix these entries before submitting:\n\n" + "\n".join(errors))
-            elif not selected:
-                st.warning("Select at least one new UID to submit. Existing UIDs are skipped.")
+            elif not rows_to_save:
+                st.warning("There are no new UIDs to submit. Existing UIDs are skipped.")
             else:
                 try:
-                    worksheet.append_rows(selected, value_input_option="RAW")
+                    worksheet.append_rows(rows_to_save, value_input_option="RAW", table_range="A:B")
                     st.session_state.submit_notice = (
                         "success",
-                        f"Successfully added {len(selected)} UID(s) to the main database.",
+                        f"Successfully added {len(rows_to_save)} UID(s) to the database.",
                     )
                     st.session_state.review_data = None
                     st.session_state.processed_signature = current_signature
                     st.rerun()
                 except Exception as exc:
                     st.error(
-                        "Could not save to the main UID database. "
-                        "Check Google Sheets access and try again. "
+                        "Could not save to the UID database. Check Google Sheets access and try again. "
                         f"Details: {exc}"
                     )
 
 st.divider()
 st.caption(
-    "This is a public submission app. Anyone with access can submit entries directly to the main database. "
-    "The app validates 8-digit UIDs and skips UIDs that already exist. Review names carefully because OCR can make mistakes."
+    "Public website: all new, valid, non-duplicate entries are submitted together. "
+    "Only Name and UID are written to the database. OCR may misread names or digits, so review the table before submitting."
 )
