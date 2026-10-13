@@ -10,6 +10,12 @@ import gspread
 import pandas as pd
 import pytesseract
 import streamlit as st
+
+try:
+    from rapidocr import RapidOCR
+except Exception:
+    # Keep Tesseract working if the secondary engine cannot be imported.
+    RapidOCR = None
 from google.oauth2.service_account import Credentials
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 
@@ -22,6 +28,13 @@ IGNORED_NAMES = {
     "uid", "id", "level", "lvl", "profile", "player profile", "copy",
     "server", "guild", "rank", "power", "close",
 }
+
+
+@st.cache_resource
+def get_rapidocr_engine():
+    if RapidOCR is None:
+        raise RuntimeError("RapidOCR is not installed")
+    return RapidOCR()
 
 
 @st.cache_resource
@@ -107,7 +120,7 @@ def fallback_ocr_variants(image):
 
 
 def extract_image(image, source):
-    """Try the normal OCR pass first, then retry only if no UID was found."""
+    """Try Tesseract first, then varied Tesseract passes and an independent RapidOCR model."""
     primary_text = pytesseract.image_to_string(
         preprocess_image(image), config="--oem 3 --psm 6"
     )
@@ -116,7 +129,7 @@ def extract_image(image, source):
 
     if primary_uids:
         selected_uids = primary_uids
-        method_note = "primary OCR"
+        method_note = "primary Tesseract OCR"
     else:
         votes = Counter()
         candidate_texts = {}
@@ -127,43 +140,91 @@ def extract_image(image, source):
                 # One failed variant should not prevent the remaining retry attempts.
                 continue
             candidates = find_uid_candidates(text)
-            # Count a candidate at most once for each OCR variant.
+            # Count a candidate at most once for each Tesseract variant.
             for uid in candidates:
                 votes[uid] += 1
                 candidate_texts.setdefault(uid, []).append((text, variant_name))
 
-        if not votes:
-            return [], "No UID detected after fallback retries"
-
-        repeated = sorted(uid for uid, count in votes.items() if count >= 2)
-        all_candidates = sorted(votes)
-
-        if repeated:
-            # Prefer UID values independently reproduced by at least two OCR variants.
-            selected_uids = repeated
-            selected_texts = [
-                (text, [uid])
-                for uid in selected_uids
-                for text, _variant in candidate_texts.get(uid, [])
-            ]
-            other_candidates = sorted(set(all_candidates) - set(repeated))
-            method_note = "Fallback OCR recovered; verify before saving"
-            if other_candidates:
-                method_note += (
-                    "; other one-pass candidate(s): " + ", ".join(other_candidates)
+        # Run a separate OCR model only on pages missed by the primary Tesseract pass.
+        rapid_text = ""
+        rapid_candidates = set()
+        rapid_available = RapidOCR is not None
+        if rapid_available:
+            try:
+                rapid_result = get_rapidocr_engine()(
+                    ImageOps.exif_transpose(image).convert("RGB")
                 )
-        elif len(all_candidates) == 1:
-            # A single fallback candidate is useful, but should be visually verified.
-            selected_uids = all_candidates
-            selected_texts = [
-                (text, [uid])
-                for uid in selected_uids
-                for text, _variant in candidate_texts.get(uid, [])
-            ]
-            method_note = "Fallback OCR single-pass candidate; verify before saving"
+                rapid_lines = getattr(rapid_result, "txts", None) or ()
+                rapid_text = "\n".join(str(line) for line in rapid_lines if line)
+                rapid_candidates = find_uid_candidates(rapid_text)
+                for uid in rapid_candidates:
+                    candidate_texts.setdefault(uid, []).append((rapid_text, "RapidOCR"))
+            except Exception:
+                # If the secondary model fails, continue with the Tesseract retries.
+                rapid_candidates = set()
+
+        tesseract_candidates = set(votes)
+        all_candidates = sorted(tesseract_candidates | rapid_candidates)
+
+        if not all_candidates:
+            if rapid_available:
+                return [], "No UID detected after Tesseract and RapidOCR retries"
+            return [], "No UID detected after Tesseract retries (RapidOCR unavailable)"
+
+        if rapid_candidates:
+            shared_candidates = sorted(tesseract_candidates & rapid_candidates)
+            if shared_candidates:
+                # Independent OCR engines agree on these UID values.
+                selected_uids = shared_candidates
+                selected_texts = [
+                    (text, [uid])
+                    for uid in selected_uids
+                    for text, _variant in candidate_texts.get(uid, [])
+                ]
+                disagreements = sorted(set(all_candidates) - set(shared_candidates))
+                method_note = "Fallback OCR engines agreed; verify before saving"
+                if disagreements:
+                    method_note += (
+                        "; conflicting candidate(s) not auto-selected: "
+                        + ", ".join(disagreements)
+                    )
+            elif not tesseract_candidates and len(rapid_candidates) == 1:
+                # A single UID returned by the independent engine is useful but still reviewable.
+                selected_uids = sorted(rapid_candidates)
+                selected_texts = [(rapid_text, selected_uids)]
+                method_note = "RapidOCR fallback candidate; verify before saving"
+            else:
+                # Different engines disagree; never silently select one candidate.
+                return [], "Ambiguous fallback candidates (Tesseract vs RapidOCR): " + ", ".join(all_candidates)
+        elif votes:
+            repeated = sorted(uid for uid, count in votes.items() if count >= 2)
+            if repeated:
+                selected_uids = repeated
+                selected_texts = [
+                    (text, [uid])
+                    for uid in selected_uids
+                    for text, _variant in candidate_texts.get(uid, [])
+                ]
+                other_candidates = sorted(set(all_candidates) - set(repeated))
+                method_note = "Tesseract fallback recovered; verify before saving"
+                if other_candidates:
+                    method_note += (
+                        "; other one-pass candidate(s): " + ", ".join(other_candidates)
+                    )
+            elif len(all_candidates) == 1:
+                # A single fallback candidate is useful, but should be visually verified.
+                selected_uids = all_candidates
+                selected_texts = [
+                    (text, [uid])
+                    for uid in selected_uids
+                    for text, _variant in candidate_texts.get(uid, [])
+                ]
+                method_note = "Tesseract fallback single-pass candidate; verify before saving"
+            else:
+                # Several unconfirmed candidates without independent-engine agreement are ambiguous.
+                return [], "Ambiguous fallback candidates: " + ", ".join(all_candidates)
         else:
-            # Do not silently pick one when retry variants disagree.
-            return [], "Ambiguous fallback candidates: " + ", ".join(all_candidates)
+            return [], "No UID detected after Tesseract and RapidOCR retries"
 
     # Use text from the pass that detected each selected UID to associate nearby names.
     rows, seen = [], set()
@@ -201,124 +262,6 @@ def extract_image(image, source):
                     break
         rows.append({"Name": player_name, "UID": uid, "Source": source})
     return rows, method_note
-
-def looks_like_name(line):
-    cleaned = re.sub(r"\s+", " ", line).strip(" |:：#-—")
-    low = cleaned.lower()
-    if not 2 <= len(cleaned) <= 36 or low in IGNORED_NAMES or UID_RE.search(cleaned):
-        return False
-    if re.search(r"\b(level|server|power|rank|uid|id)\b", low):
-        return False
-    return sum(char.isdigit() for char in cleaned) <= 3
-
-
-def extract_image(image, source):
-    text = pytesseract.image_to_string(preprocess_image(image), config="--psm 6")
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    results, seen = [], set()
-
-    for index, line in enumerate(lines):
-        for uid in UID_RE.findall(line):
-            # One occurrence per UID per image/page; cross-image repeats are reported separately.
-            if uid in seen:
-                continue
-            seen.add(uid)
-            player_name = ""
-            for neighbor in (index - 1, index + 1, index - 2, index + 2):
-                if 0 <= neighbor < len(lines) and looks_like_name(lines[neighbor]):
-                    player_name = re.sub(r"\s+", " ", lines[neighbor]).strip()
-                    break
-            results.append({"Name": player_name, "UID": uid, "Source": source})
-    return results
-
-
-def process_upload(upload):
-    """Return UID detections, per-page OCR statuses, and downloadable artifacts for problematic pages."""
-    data = upload.getvalue()
-    results, report, issue_files = [], [], {}
-
-    if upload.name.lower().endswith(".pdf"):
-        try:
-            document = fitz.open(stream=data, filetype="pdf")
-        except Exception as exc:
-            report.append({
-                "File / page": upload.name,
-                "Result": f"Could not open PDF: {exc}",
-                "UIDs found": "",
-            })
-            issue_files[upload.name] = (upload.name, data)
-            return results, report, issue_files
-
-        if document.page_count > 40:
-            report.append({
-                "File / page": upload.name,
-                "Result": "Not processed: PDF has more than 40 pages. Split into smaller PDFs.",
-                "UIDs found": "",
-            })
-            issue_files[upload.name] = (upload.name, data)
-            return results, report, issue_files
-
-        base_name = upload.name.rsplit(".", 1)[0]
-        for page_index, page in enumerate(document):
-            source = f"{upload.name} — page {page_index + 1}"
-            page_png = None
-            try:
-                pixmap = page.get_pixmap(matrix=fitz.Matrix(2.3, 2.3), alpha=False)
-                page_png = pixmap.tobytes("png")
-                image = Image.open(io.BytesIO(page_png))
-                page_rows, ocr_note = extract_image(image, source)
-                results.extend(page_rows)
-                found = ", ".join(row["UID"] for row in page_rows)
-                report.append({
-                    "File / page": source,
-                    "Result": (
-                        f"Found {len(page_rows)} UID(s) — {ocr_note}"
-                        if page_rows
-                        else ocr_note
-                    ),
-                    "UIDs found": found,
-                })
-                if not page_rows:
-                    issue_suffix = "ambiguous" if ocr_note.startswith("Ambiguous fallback") else "no_uid"
-                    issue_files[source] = (f"{base_name}_page_{page_index + 1:03d}_{issue_suffix}.png", page_png)
-            except Exception as exc:
-                report.append({
-                    "File / page": source,
-                    "Result": f"OCR error: {exc}",
-                    "UIDs found": "",
-                })
-                if page_png:
-                    issue_files[source] = (f"{base_name}_page_{page_index + 1:03d}_ocr_error.png", page_png)
-                else:
-                    # If the page cannot be rendered, preserve the original PDF for inspection.
-                    issue_files[source] = (upload.name, data)
-    else:
-        source = upload.name
-        try:
-            image = Image.open(io.BytesIO(data))
-            rows, ocr_note = extract_image(image, source)
-            results.extend(rows)
-            report.append({
-                "File / page": source,
-                "Result": (
-                    f"Found {len(rows)} UID(s) — {ocr_note}"
-                    if rows
-                    else ocr_note
-                ),
-                "UIDs found": ", ".join(row["UID"] for row in rows),
-            })
-            if not rows:
-                issue_files[source] = (upload.name, data)
-        except Exception as exc:
-            report.append({
-                "File / page": source,
-                "Result": f"Could not read/OCR image: {exc}",
-                "UIDs found": "",
-            })
-            issue_files[source] = (upload.name, data)
-
-    return results, report, issue_files
-
 
 def build_issue_zip(issue_rows, issue_files):
     """Create a ZIP containing only the images/files listed in the no-UID or OCR-error report."""
