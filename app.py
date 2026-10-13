@@ -1,4 +1,5 @@
 import io
+import json
 import re
 from datetime import datetime, timezone
 
@@ -46,7 +47,7 @@ IGNORED_NAMES = {
 @st.cache_resource
 def get_sheets_client():
     credentials = Credentials.from_service_account_info(
-        dict(st.secrets["gcp_service_account"]),
+        json.loads(st.secrets["gcp_service_account_json"]),
         scopes=["https://www.googleapis.com/auth/spreadsheets"],
     )
     return gspread.authorize(credentials)
