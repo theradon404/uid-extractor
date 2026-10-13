@@ -2,6 +2,7 @@ import hashlib
 import io
 import json
 import re
+from collections import defaultdict
 
 import fitz
 import gspread
@@ -79,13 +80,14 @@ def looks_like_name(line):
     return sum(char.isdigit() for char in cleaned) <= 3
 
 
-def extract_image(image):
+def extract_image(image, source):
     text = pytesseract.image_to_string(preprocess_image(image), config="--psm 6")
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     results, seen = [], set()
 
     for index, line in enumerate(lines):
         for uid in UID_RE.findall(line):
+            # One occurrence per UID per image/page; cross-image repeats are reported separately.
             if uid in seen:
                 continue
             seen.add(uid)
@@ -94,24 +96,66 @@ def extract_image(image):
                 if 0 <= neighbor < len(lines) and looks_like_name(lines[neighbor]):
                     player_name = re.sub(r"\s+", " ", lines[neighbor]).strip()
                     break
-            results.append({"Name": player_name, "UID": uid})
+            results.append({"Name": player_name, "UID": uid, "Source": source})
     return results
 
 
 def process_upload(upload):
+    """Return all UID detections and a per-image/page OCR report."""
     data = upload.getvalue()
-    results = []
+    results, report = [], []
+
     if upload.name.lower().endswith(".pdf"):
-        document = fitz.open(stream=data, filetype="pdf")
+        try:
+            document = fitz.open(stream=data, filetype="pdf")
+        except Exception as exc:
+            return [], [{"File / page": upload.name, "Result": f"Could not open PDF: {exc}", "UIDs found": ""}]
+
         if document.page_count > 40:
-            raise ValueError("PDF has more than 40 pages. Please split it into smaller files.")
-        for page in document:
-            pixmap = page.get_pixmap(matrix=fitz.Matrix(2.3, 2.3), alpha=False)
-            image = Image.open(io.BytesIO(pixmap.tobytes("png")))
-            results.extend(extract_image(image))
+            return [], [{
+                "File / page": upload.name,
+                "Result": "Not processed: PDF has more than 40 pages. Split into smaller PDFs.",
+                "UIDs found": "",
+            }]
+
+        for page_index, page in enumerate(document):
+            source = f"{upload.name} — page {page_index + 1}"
+            try:
+                pixmap = page.get_pixmap(matrix=fitz.Matrix(2.3, 2.3), alpha=False)
+                image = Image.open(io.BytesIO(pixmap.tobytes("png")))
+                page_rows = extract_image(image, source)
+                results.extend(page_rows)
+                found = ", ".join(row["UID"] for row in page_rows)
+                report.append({
+                    "File / page": source,
+                    "Result": f"Found {len(page_rows)} UID(s)" if page_rows else "No 8-digit UID detected",
+                    "UIDs found": found,
+                })
+            except Exception as exc:
+                report.append({
+                    "File / page": source,
+                    "Result": f"OCR error: {exc}",
+                    "UIDs found": "",
+                })
     else:
-        results.extend(extract_image(Image.open(io.BytesIO(data))))
-    return results
+        source = upload.name
+        try:
+            image = Image.open(io.BytesIO(data))
+            rows = extract_image(image, source)
+            results.extend(rows)
+            report.append({
+                "File / page": source,
+                "Result": f"Found {len(rows)} UID(s)" if rows else "No 8-digit UID detected",
+                "UIDs found": ", ".join(row["UID"] for row in rows),
+            })
+        except Exception as exc:
+            report.append({
+                "File / page": source,
+                "Result": f"Could not read/OCR image: {exc}",
+                "UIDs found": "",
+            })
+
+    return results, report
 
 
 st.subheader("1. Upload screenshots or PDFs")
@@ -123,12 +167,16 @@ uploads = st.file_uploader(
     max_upload_size=15,
 )
 
-if "processed_signature" not in st.session_state:
-    st.session_state.processed_signature = None
-if "review_data" not in st.session_state:
-    st.session_state.review_data = None
-if "submit_notice" not in st.session_state:
-    st.session_state.submit_notice = None
+for key, initial in (
+    ("processed_signature", None),
+    ("review_data", None),
+    ("submit_notice", None),
+    ("ocr_file_report", None),
+    ("duplicate_report", None),
+    ("uid_sources", None),
+):
+    if key not in st.session_state:
+        st.session_state[key] = initial
 
 current_signature = None
 if uploads:
@@ -140,25 +188,52 @@ elif st.session_state.processed_signature is not None:
     st.session_state.processed_signature = None
     st.session_state.review_data = None
     st.session_state.submit_notice = None
+    st.session_state.ocr_file_report = None
+    st.session_state.duplicate_report = None
+    st.session_state.uid_sources = None
 
-# Run OCR once when the selected files change.
+# OCR automatically when the selected upload set changes.
 if uploads and current_signature != st.session_state.processed_signature:
-    extracted = []
+    all_detections, file_report = [], []
     with st.spinner("Reading images and PDF pages..."):
         for upload in uploads:
-            try:
-                extracted.extend(process_upload(upload))
-            except Exception as exc:
-                st.warning(f"Could not process {upload.name}: {exc}")
+            detections, per_file_report = process_upload(upload)
+            all_detections.extend(detections)
+            file_report.extend(per_file_report)
 
-    # Deduplicate UID values across all uploaded files, preserving first occurrence.
-    unique_rows, seen = [], set()
-    for row in extracted:
-        if row["UID"] not in seen:
-            seen.add(row["UID"])
-            unique_rows.append(row)
+    # Track all source locations before deduplicating rows for the review table.
+    sources_by_uid = defaultdict(list)
+    first_row_by_uid = {}
+    for row in all_detections:
+        uid = row["UID"]
+        sources_by_uid[uid].append(row["Source"])
+        if uid not in first_row_by_uid:
+            first_row_by_uid[uid] = {"Name": row["Name"], "UID": uid}
 
-    st.session_state.review_data = pd.DataFrame(unique_rows, columns=["Name", "UID"])
+    duplicate_report = []
+    duplicate_occurrences = 0
+    for uid, sources in sources_by_uid.items():
+        if len(sources) > 1:
+            duplicate_occurrences += len(sources) - 1
+            duplicate_report.append({
+                "UID": uid,
+                "First found in": sources[0],
+                "Duplicate found in": ", ".join(sources[1:]),
+                "Occurrences": len(sources),
+            })
+
+    st.session_state.review_data = pd.DataFrame(
+        list(first_row_by_uid.values()), columns=["Name", "UID"]
+    )
+    st.session_state.ocr_file_report = file_report
+    st.session_state.duplicate_report = {
+        "items": duplicate_report,
+        "duplicate_occurrences": duplicate_occurrences,
+        "unique_repeated_uids": len(duplicate_report),
+        "uid_count": len(first_row_by_uid),
+        "detection_count": len(all_detections),
+    }
+    st.session_state.uid_sources = {uid: list(dict.fromkeys(sources)) for uid, sources in sources_by_uid.items()}
     st.session_state.processed_signature = current_signature
     st.session_state.submit_notice = None
 
@@ -171,10 +246,44 @@ if st.session_state.submit_notice:
     else:
         st.warning(message)
 
+if uploads and st.session_state.ocr_file_report is not None:
+    st.subheader("2. Upload and OCR report")
+    report_data = st.session_state.ocr_file_report
+    duplicate_data = st.session_state.duplicate_report or {}
+    no_uid_rows = [
+        row for row in report_data
+        if row["Result"] == "No 8-digit UID detected"
+        or row["Result"].startswith("OCR error")
+        or row["Result"].startswith("Could not")
+        or row["Result"].startswith("Not processed")
+    ]
+
+    metric1, metric2, metric3, metric4 = st.columns(4)
+    metric1.metric("Files/pages checked", len(report_data))
+    metric2.metric("Unique UIDs found", duplicate_data.get("uid_count", 0))
+    metric3.metric("Duplicate occurrences", duplicate_data.get("duplicate_occurrences", 0))
+    metric4.metric("Pages with no UID / error", len(no_uid_rows))
+
+    st.dataframe(pd.DataFrame(report_data), use_container_width=True, hide_index=True)
+
+    if duplicate_data.get("items"):
+        st.warning(
+            f"Found {duplicate_data['duplicate_occurrences']} duplicate occurrence(s) "
+            f"across {duplicate_data['unique_repeated_uids']} repeated UID value(s)."
+        )
+        with st.expander("See which UID and picture/page was duplicated", expanded=True):
+            st.dataframe(pd.DataFrame(duplicate_data["items"]), use_container_width=True, hide_index=True)
+    else:
+        st.success("No duplicate UIDs were found across the uploaded images/PDF pages.")
+
+    if no_uid_rows:
+        with st.expander("See files/pages where OCR found no UID or failed", expanded=True):
+            st.dataframe(pd.DataFrame(no_uid_rows), use_container_width=True, hide_index=True)
+
 if uploads and st.session_state.review_data is not None:
-    st.subheader("2. Review all extracted entries")
+    st.subheader("3. Review all unique extracted entries")
     if st.session_state.review_data.empty:
-        st.warning("No 8-digit UIDs were detected. Try a clearer screenshot or crop the profile area.")
+        st.warning("No 8-digit UIDs were detected in the uploaded files. Check the OCR report above.")
     else:
         try:
             worksheet = get_worksheet()
@@ -190,17 +299,25 @@ if uploads and st.session_state.review_data is not None:
         review = st.session_state.review_data[["Name", "UID"]].copy()
         review["Name"] = review["Name"].astype(str).str.strip()
         review["UID"] = review["UID"].astype(str).str.strip()
-        already_count = sum(uid in known_uids for uid in review["UID"])
-
+        already_in_sheet = [uid for uid in review["UID"] if uid in known_uids]
         st.write(
             f"Found **{len(review)}** unique UID(s). "
-            f"Already in the database: **{already_count}**."
+            f"Already in the database: **{len(set(already_in_sheet))}**."
         )
+        if already_in_sheet:
+            with st.expander("See UIDs already in the database (will be skipped)"):
+                existing_details = []
+                for uid in sorted(set(already_in_sheet)):
+                    existing_details.append({
+                        "UID": uid,
+                        "File / page": ", ".join((st.session_state.uid_sources or {}).get(uid, [])),
+                    })
+                st.dataframe(pd.DataFrame(existing_details), use_container_width=True, hide_index=True)
+
         st.caption(
             "All new, valid entries in this table will be submitted together. "
-            "You can correct a name or UID before submitting."
+            "You can correct names or UIDs before submitting."
         )
-
         edited = st.data_editor(
             review,
             use_container_width=True,
@@ -222,14 +339,13 @@ if uploads and st.session_state.review_data is not None:
 
         if st.button("Submit all new UIDs to database", type="primary", disabled=worksheet is None):
             rows_to_save, errors = [], []
-            # Re-read the database immediately before writing to reduce duplicate races.
+            # Re-read the sheet immediately before saving.
             known_uids = get_existing_uids(worksheet)
             batch_seen = set()
 
             for _, row in edited.iterrows():
                 name = str(row.get("Name", "")).strip()
                 uid = re.sub(r"\s+", "", str(row.get("UID", "")).strip())
-
                 if not re.fullmatch(r"\d{8}", uid):
                     errors.append(f"{uid or '(blank UID)'}: UID must be exactly 8 digits.")
                 elif not name:
@@ -237,7 +353,6 @@ if uploads and st.session_state.review_data is not None:
                 elif uid in known_uids or uid in batch_seen:
                     continue
                 else:
-                    # Write exactly two values per row: Name and UID.
                     rows_to_save.append([name, uid])
                     batch_seen.add(uid)
 
@@ -247,14 +362,12 @@ if uploads and st.session_state.review_data is not None:
                 st.warning("There are no new UIDs to submit. Existing UIDs are skipped.")
             else:
                 try:
-                    # Avoid append-table detection guessing the wrong location:
-                    # find the last non-empty row in columns A:B, then write to an explicit range.
+                    # Find the last occupied row in A:B and write to an explicit range.
                     sheet_values = worksheet.get("A:B")
-                    last_data_row = 1  # row 1 contains the Name / UID headers
+                    last_data_row = 1
                     for row_number, values in enumerate(sheet_values, start=1):
                         if any(str(cell).strip() for cell in values[:2]):
                             last_data_row = row_number
-
                     first_row = last_data_row + 1
                     last_row = first_row + len(rows_to_save) - 1
                     write_range = f"A{first_row}:B{last_row}"
@@ -264,25 +377,20 @@ if uploads and st.session_state.review_data is not None:
                         values=rows_to_save,
                         value_input_option="RAW",
                     )
-
-                    # Verify the exact cells we just wrote before reporting success.
                     saved_values = worksheet.get(write_range)
                     expected_values = [[str(name), str(uid)] for name, uid in rows_to_save]
                     actual_values = [
-                        [str(row[0]) if len(row) > 0 else "",
-                         str(row[1]) if len(row) > 1 else ""]
+                        [str(row[0]) if len(row) > 0 else "", str(row[1]) if len(row) > 1 else ""]
                         for row in saved_values
                     ]
                     if actual_values != expected_values:
                         raise RuntimeError(
-                            f"Write was sent to {worksheet.title}!{write_range}, "
-                            "but read-back verification did not match."
+                            f"Write sent to {worksheet.title}!{write_range}, but read-back verification did not match."
                         )
 
                     sheet_url = (
                         "https://docs.google.com/spreadsheets/d/"
-                        + str(st.secrets["spreadsheet_id"])
-                        + "/edit"
+                        + str(st.secrets["spreadsheet_id"]) + "/edit"
                     )
                     st.session_state.submit_notice = (
                         "success",
@@ -302,6 +410,6 @@ if uploads and st.session_state.review_data is not None:
 
 st.divider()
 st.caption(
-    "Public website: all new, valid, non-duplicate entries are submitted together. "
-    "Only Name and UID are written to the database. OCR may misread names or digits, so review the table before submitting."
+    "The Google Sheet stores only Name and UID. The upload report shows duplicate UIDs and files/pages "
+    "where no 8-digit UID was detected or OCR failed. Review OCR results carefully."
 )
