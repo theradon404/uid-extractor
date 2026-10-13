@@ -16,6 +16,35 @@ st.title("🔎 UID Extractor")
 st.caption("Upload game profile screenshots or PDFs, review the names and UIDs, then save approved entries.")
 
 # Authentication: Google sign-in plus an explicit approved-email allowlist.
+# Streamlit only exposes st.user.is_logged_in after [auth] is configured in app Secrets.
+AUTH_KEYS_REQUIRED = (
+    "redirect_uri",
+    "cookie_secret",
+    "client_id",
+    "client_secret",
+    "server_metadata_url",
+)
+try:
+    auth_secrets = st.secrets["auth"]
+    missing_auth_keys = [key for key in AUTH_KEYS_REQUIRED if not auth_secrets.get(key)]
+except Exception:
+    missing_auth_keys = list(AUTH_KEYS_REQUIRED)
+
+if missing_auth_keys:
+    st.error("Google sign-in is not configured yet. Add the [auth] settings in Manage app → Settings → Secrets.")
+    st.markdown("The app cannot check login status until these settings exist:")
+    st.code(
+        '[auth]\\n'
+        'redirect_uri = "https://YOUR-APP-NAME.streamlit.app/oauth2callback"\\n'
+        'cookie_secret = "A_LONG_RANDOM_SECRET"\\n'
+        'client_id = "YOUR_GOOGLE_OAUTH_CLIENT_ID"\\n'
+        'client_secret = "YOUR_GOOGLE_OAUTH_CLIENT_SECRET"\\n'
+        'server_metadata_url = "https://accounts.google.com/.well-known/openid-configuration"',
+        language="toml",
+    )
+    st.info("Replace the example values with your real Google OAuth client details and the exact deployed app URL. Do not paste secrets into chat or GitHub.")
+    st.stop()
+
 ALLOWED_EMAILS = {
     str(value).strip().lower()
     for value in st.secrets.get("allowed_emails", [])
