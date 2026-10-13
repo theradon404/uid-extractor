@@ -6,9 +6,12 @@ Public Streamlit app for extracting player names and 8-digit UIDs from game prof
 
 - Public upload page; no Google sign-in required
 - Automatic OCR after selecting image or PDF files
-- Per-file/per-page OCR report, including files/pages where no 8-digit UID was detected or OCR failed
-- Duplicate summary showing total repeated occurrences, repeated UID values, and all source images/PDF pages for each repeated UID
-- Separate report of extracted UIDs already present in the database, including the source file/page
+- Per-file/per-page OCR report, including images/pages where no 8-digit UID was detected or OCR failed
+- Download the specific no-UID/OCR-error images and PDF pages as `uid_ocr_issues.zip`
+  - Image files are included in their original format.
+  - Problematic pages in PDFs are exported as individual PNG files, not full PDFs when page rendering succeeded.
+- Duplicate summary showing total repeated occurrences, repeated UID values, and source images/PDF pages for each repeated UID
+- Report of extracted UIDs already present in the database, including source file/page
 - Editable preview with only Name and UID columns
 - One button submits all valid, new UIDs in the preview
 - Duplicate UIDs are skipped against existing spreadsheet rows and within each upload batch
@@ -20,7 +23,7 @@ The main worksheet (default name `UIDs`) must begin with these two columns:
 
 `Name | UID`
 
-The app writes exactly two values per new row. The upload report's source names and diagnostic statuses are shown in the website only; they are not written to the spreadsheet.
+The app writes exactly two values per new row. Source names and OCR diagnostics are displayed on the website only; they are not written to the spreadsheet.
 
 ## Google Sheets access
 
@@ -40,14 +43,15 @@ See `.streamlit/secrets.example.toml` for the format.
 - Each uploaded image is reported as a separate file.
 - PDFs are reported page by page.
 - Repeated UIDs are counted as duplicate occurrences beyond the first detection. The report lists the UID, where it was first found, and the additional image/page locations.
-- The OCR report lists every page/file where no 8-digit UID was detected or processing failed. “No 8-digit UID detected” does not prove OCR itself failed; the image may lack a UID or the image quality/layout may make it unreadable.
+- The OCR report lists each file/page where no 8-digit UID was detected or processing failed. The ZIP download below that table contains only those reported source items. Problematic PDF pages are exported separately as PNG images, allowing only the affected pages to be downloaded.
+- “No 8-digit UID detected” does not prove OCR itself failed; the image may lack a UID or the image quality/layout may make it unreadable.
 - OCR can misread decorative usernames and digits, so review and correct names/UIDs before submitting.
 
 ## Public submission warning
 
 Because the website is public and writes directly to the main spreadsheet, anyone who can use it may add data. Validation enforces an 8-digit UID, requires a name, and skips UIDs already present, but it does not fully prevent deliberate spam or incorrect submissions.
 
-## Usage limits
+## Usage notes
 
 - PDFs are limited to 40 pages per file.
 - Each upload is limited to 15 MB.
