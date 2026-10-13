@@ -384,7 +384,7 @@ if uploads and st.session_state.ocr_file_report is not None:
     no_uid_rows = [
         row for row in report_data
         if row["Result"] == "No 8-digit UID detected"
-        or row["Result"].startswith("No UID detected after fallback")
+        or row["Result"].startswith("No UID detected after")
         or row["Result"].startswith("Ambiguous fallback candidates")
         or row["Result"].startswith("OCR error")
         or row["Result"].startswith("Could not")
