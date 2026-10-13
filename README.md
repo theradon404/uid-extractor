@@ -1,24 +1,26 @@
 # UID Extractor
 
-Public Streamlit app for extracting player names and 8-digit UIDs from game profile screenshots and PDF pages, reviewing/editing them, and submitting selected rows directly to a Google Sheet.
+Public Streamlit app for extracting player names and 8-digit UIDs from game profile screenshots and PDF pages, reviewing the results, and submitting all new entries directly to Google Sheets.
 
 ## Features
 
 - Public upload page; no Google sign-in required
 - Automatic OCR after selecting image or PDF files
-- Editable review table with per-row selection checkboxes
-- Direct submission of selected, valid UIDs into the main `UIDs` worksheet
-- Duplicate checks against existing spreadsheet rows and within an upload batch
-- CSV download of the reviewed extraction
+- Editable preview with only Name and UID columns
+- One button submits all valid, new UIDs in the preview
+- Duplicate UIDs are skipped against existing spreadsheet rows and within each upload batch
+- CSV download of reviewed data
 - Image uploads and page-by-page PDF processing
 
 ## 1. Prepare your Google Sheet
 
-Create a spreadsheet with a worksheet named `UIDs`. The first row should contain:
+Create a spreadsheet with a worksheet named `UIDs`. The first two cells in row 1 should be:
 
-`Name | UID | SubmittedBy | SubmittedAt`
+`Name | UID`
 
-The app will create the worksheet and headers if needed. The configured service account must have Editor access to the spreadsheet.
+The app writes exactly two values per new row: player name and UID. If the worksheet already has extra columns from an earlier version, the app does not delete existing data in those columns; you can remove the old extra columns manually if you want the sheet to display only Name and UID.
+
+The configured service account must have Editor access to the spreadsheet.
 
 ## 2. Configure Google Sheets access
 
@@ -32,7 +34,7 @@ The app will create the worksheet and headers if needed. The configured service 
 In Streamlit Community Cloud, open the app's menu and go to **Settings → Secrets**. Add:
 - `spreadsheet_id`: your spreadsheet ID
 - `worksheet_name`: `UIDs`
-- `gcp_service_account_json`: the full downloaded service-account JSON object, wrapped as a multi-line TOML triple-quoted string. See `.streamlit/secrets.example.toml`.
+- `gcp_service_account_json`: the full downloaded service-account JSON object wrapped as a multi-line TOML triple-quoted string. See `.streamlit/secrets.example.toml`.
 
 Do not put the real JSON key in the repository. Save the Secrets and restart the app.
 
@@ -44,14 +46,14 @@ Deploy this repository to Streamlit Community Cloud with `app.py` as the main fi
 
 1. A visitor uploads one or more screenshots or PDFs.
 2. OCR runs automatically and the review table appears.
-3. The visitor corrects names if needed and selects which rows to submit.
-4. Clicking **Submit selected UIDs to database** writes selected, valid, new UIDs directly into `UIDs`.
+3. The visitor can correct names or UIDs; there is no per-row selection.
+4. Clicking **Submit all new UIDs to database** sends every valid, new row in the table to the `UIDs` worksheet.
 
-There is no Pending queue and no separate owner approval step in this version.
+Only `Name` and `UID` are written. Existing UIDs are skipped. The app does not use a Pending queue or owner approval step.
 
 ## Important security note
 
-Because the website is public and writes directly to the main spreadsheet, anyone who can use it may add data. Validation enforces an 8-digit UID, requires a name, and skips UIDs already present, but it does not fully prevent deliberate spam or incorrect entries. If abuse becomes an issue, restore an approval queue or add stronger access controls/rate limits.
+Because the website is public and writes directly to the main spreadsheet, anyone who can use it may add data. Validation enforces an 8-digit UID, requires a name, and skips UIDs already present, but it does not fully prevent deliberate spam or incorrect submissions. If abuse becomes an issue, add stronger access controls or rate limiting.
 
 ## OCR and usage notes
 
@@ -75,4 +77,4 @@ streamlit run app.py
 
 Local secrets go in `.streamlit/secrets.toml`; use `.streamlit/secrets.example.toml` as a template. Never commit a real secrets file.
 
-This is a starter project, not a security audit. Keep credentials private, review extracted data carefully, and update dependencies periodically.
+This is a starter project, not a security audit. Keep credentials private and update dependencies periodically.
