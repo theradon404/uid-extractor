@@ -166,6 +166,8 @@ if st.session_state.submit_notice:
     kind, message = st.session_state.submit_notice
     if kind == "success":
         st.success(message)
+        if st.session_state.get("saved_sheet_url"):
+            st.markdown(f"[Open the Google Sheet]({st.session_state.saved_sheet_url})")
     else:
         st.warning(message)
 
@@ -245,18 +247,57 @@ if uploads and st.session_state.review_data is not None:
                 st.warning("There are no new UIDs to submit. Existing UIDs are skipped.")
             else:
                 try:
-                    worksheet.append_rows(rows_to_save, value_input_option="RAW", table_range="A:B")
+                    # Avoid append-table detection guessing the wrong location:
+                    # find the last non-empty row in columns A:B, then write to an explicit range.
+                    sheet_values = worksheet.get("A:B")
+                    last_data_row = 1  # row 1 contains the Name / UID headers
+                    for row_number, values in enumerate(sheet_values, start=1):
+                        if any(str(cell).strip() for cell in values[:2]):
+                            last_data_row = row_number
+
+                    first_row = last_data_row + 1
+                    last_row = first_row + len(rows_to_save) - 1
+                    write_range = f"A{first_row}:B{last_row}"
+
+                    worksheet.update(
+                        range_name=write_range,
+                        values=rows_to_save,
+                        value_input_option="RAW",
+                    )
+
+                    # Verify the exact cells we just wrote before reporting success.
+                    saved_values = worksheet.get(write_range)
+                    expected_values = [[str(name), str(uid)] for name, uid in rows_to_save]
+                    actual_values = [
+                        [str(row[0]) if len(row) > 0 else "",
+                         str(row[1]) if len(row) > 1 else ""]
+                        for row in saved_values
+                    ]
+                    if actual_values != expected_values:
+                        raise RuntimeError(
+                            f"Write was sent to {worksheet.title}!{write_range}, "
+                            "but read-back verification did not match."
+                        )
+
+                    sheet_url = (
+                        "https://docs.google.com/spreadsheets/d/"
+                        + str(st.secrets["spreadsheet_id"])
+                        + "/edit"
+                    )
                     st.session_state.submit_notice = (
                         "success",
-                        f"Successfully added {len(rows_to_save)} UID(s) to the database.",
+                        f"Verified {len(rows_to_save)} UID(s) in worksheet "
+                        f"“{worksheet.title}”, cells {write_range}.",
                     )
+                    st.session_state.saved_sheet_url = sheet_url
                     st.session_state.review_data = None
                     st.session_state.processed_signature = current_signature
                     st.rerun()
                 except Exception as exc:
                     st.error(
-                        "Could not save to the UID database. Check Google Sheets access and try again. "
-                        f"Details: {exc}"
+                        "Could not verify the saved rows in the configured Google Sheet. "
+                        "No success message was shown. Check the spreadsheet ID, the UIDs tab, "
+                        f"and the service account's Editor access. Details: {exc}"
                     )
 
 st.divider()
