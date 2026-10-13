@@ -21,7 +21,7 @@ st.info(
     "they are not added to the main UID database until the site owner approves them."
 )
 
-UID_RE = re.compile(r"(?<!\\d)(\\d{8})(?!\\d)")
+UID_RE = re.compile(r"(?<!\d)(\d{8})(?!\d)")
 IGNORED_NAMES = {
     "uid", "id", "level", "lvl", "profile", "player profile", "copy",
     "server", "guild", "rank", "power", "close"
@@ -100,11 +100,11 @@ def preprocess_image(image):
 
 
 def looks_like_name(line):
-    cleaned = re.sub(r"\\s+", " ", line).strip(" |:：#-—")
+    cleaned = re.sub(r"\s+", " ", line).strip(" |:：#-—")
     low = cleaned.lower()
     if not 2 <= len(cleaned) <= 36 or low in IGNORED_NAMES or UID_RE.search(cleaned):
         return False
-    if re.search(r"\\b(level|server|power|rank|uid|id)\\b", low):
+    if re.search(r"\b(level|server|power|rank|uid|id)\b", low):
         return False
     return sum(char.isdigit() for char in cleaned) <= 3
 
@@ -121,7 +121,7 @@ def extract_image(image, source):
             player_name = ""
             for neighbor in (index - 1, index + 1, index - 2, index + 2):
                 if 0 <= neighbor < len(lines) and looks_like_name(lines[neighbor]):
-                    player_name = re.sub(r"\\s+", " ", lines[neighbor]).strip()
+                    player_name = re.sub(r"\s+", " ", lines[neighbor]).strip()
                     break
             results.append({"Name": player_name, "UID": uid, "Source": source, "Submit": True})
     return results
@@ -215,9 +215,9 @@ if st.session_state.review_data is not None:
             if not bool(row.get("Submit", False)):
                 continue
             name = str(row.get("Name", "")).strip()
-            uid = re.sub(r"\\s+", "", str(row.get("UID", "")).strip())
+            uid = re.sub(r"\s+", "", str(row.get("UID", "")).strip())
             source = str(row.get("Source", "public upload")).strip()[:250]
-            if not re.fullmatch(r"\\d{8}", uid):
+            if not re.fullmatch(r"\d{8}", uid):
                 errors.append(f"{uid or '(blank UID)'}: UID must be exactly 8 digits.")
             elif not name:
                 errors.append(f"{uid}: player name is blank.")
@@ -229,7 +229,7 @@ if st.session_state.review_data is not None:
                 ])
 
         if errors:
-            st.error("Fix these entries before submitting:\\n\\n" + "\\n".join(errors))
+            st.error("Fix these entries before submitting:\n\n" + "\n".join(errors))
         elif not rows_to_submit:
             st.warning("No entries were selected.")
         else:
@@ -312,11 +312,11 @@ if st.session_state.get("admin_authenticated", False):
                 to_append, statuses, errors = [], [], []
                 for _, row in edited_pending.iterrows():
                     sheet_row = int(row["_sheet_row"])
-                    uid = re.sub(r"\\s+", "", str(row.get("UID", "")).strip())
+                    uid = re.sub(r"\s+", "", str(row.get("UID", "")).strip())
                     name = str(row.get("Name", "")).strip()
                     if not bool(row.get("Approve", False)):
                         continue
-                    if not re.fullmatch(r"\\d{8}", uid) or not name:
+                    if not re.fullmatch(r"\d{8}", uid) or not name:
                         errors.append(f"Pending row {sheet_row}: fix the name and 8-digit UID.")
                     elif uid in known:
                         statuses.append((sheet_row, "Duplicate"))
@@ -336,7 +336,7 @@ if st.session_state.get("admin_authenticated", False):
                 if statuses and not to_append:
                     st.info("Selected entries were marked as duplicates where appropriate.")
                 if errors:
-                    st.error("Some entries were not processed:\\n\\n" + "\\n".join(errors))
+                    st.error("Some entries were not processed:\n\n" + "\n".join(errors))
                 st.rerun()
     except Exception as exc:
         st.error(f"Could not load the pending queue. Check Google Sheets Secrets and permissions. Details: {exc}")
