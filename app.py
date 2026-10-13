@@ -3,7 +3,7 @@ import io
 import json
 import re
 import zipfile
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 import fitz
 import gspread
@@ -11,7 +11,7 @@ import pandas as pd
 import pytesseract
 import streamlit as st
 from google.oauth2.service_account import Credentials
-from PIL import Image, ImageEnhance, ImageOps
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 
 st.set_page_config(page_title="UID Extractor", page_icon="🔎", layout="wide")
 st.title("🔎 UID Extractor")
@@ -70,6 +70,137 @@ def preprocess_image(image):
         image = image.resize((int(image.width * scale), int(image.height * scale)))
     return ImageEnhance.Contrast(ImageOps.grayscale(image)).enhance(1.7)
 
+
+def find_uid_candidates(text):
+    """Find 8-digit UIDs, including digits split by OCR into single spaces or hyphens."""
+    candidates = set(UID_RE.findall(text))
+    for match in re.finditer(r"(?<!\d)(\d(?:[ \t-]?\d){7})(?!\d)", text):
+        digits = re.sub(r"\D", "", match.group(1))
+        if len(digits) == 8:
+            candidates.add(digits)
+    return candidates
+
+
+def fallback_ocr_variants(image):
+    """Create a few inexpensive preprocessing variants for difficult images."""
+    base = ImageOps.exif_transpose(image).convert("RGB")
+    gray = ImageOps.grayscale(base)
+    if gray.width < 1600:
+        scale = min(3, 1600 / gray.width)
+        gray = gray.resize((int(gray.width * scale), int(gray.height * scale)))
+    gray = ImageOps.autocontrast(gray)
+    sharp = gray.filter(ImageFilter.UnsharpMask(radius=2, percent=170, threshold=3))
+
+    threshold_135 = sharp.point(lambda pixel: 255 if pixel >= 135 else 0)
+    threshold_175 = sharp.point(lambda pixel: 255 if pixel >= 175 else 0)
+    return [
+        ("sharpened layout", sharp, "--oem 3 --psm 11"),
+        ("threshold 135", threshold_135, "--oem 3 --psm 6"),
+        ("threshold 175", threshold_175, "--oem 3 --psm 11"),
+        ("inverted threshold", ImageOps.invert(threshold_135), "--oem 3 --psm 11"),
+        (
+            "digits-only",
+            sharp,
+            "--oem 3 --psm 11 -c tessedit_char_whitelist=0123456789",
+        ),
+    ]
+
+
+def extract_image(image, source):
+    """Try the normal OCR pass first, then retry only if no UID was found."""
+    primary_text = pytesseract.image_to_string(
+        preprocess_image(image), config="--oem 3 --psm 6"
+    )
+    primary_uids = sorted(set(UID_RE.findall(primary_text)))
+    selected_texts = [(primary_text, primary_uids)]
+
+    if primary_uids:
+        selected_uids = primary_uids
+        method_note = "primary OCR"
+    else:
+        votes = Counter()
+        candidate_texts = {}
+        for variant_name, variant_image, config in fallback_ocr_variants(image):
+            try:
+                text = pytesseract.image_to_string(variant_image, config=config)
+            except Exception:
+                # One failed variant should not prevent the remaining retry attempts.
+                continue
+            candidates = find_uid_candidates(text)
+            # Count a candidate at most once for each OCR variant.
+            for uid in candidates:
+                votes[uid] += 1
+                candidate_texts.setdefault(uid, []).append((text, variant_name))
+
+        if not votes:
+            return [], "No UID detected after fallback retries"
+
+        repeated = sorted(uid for uid, count in votes.items() if count >= 2)
+        all_candidates = sorted(votes)
+
+        if repeated:
+            # Prefer UID values independently reproduced by at least two OCR variants.
+            selected_uids = repeated
+            selected_texts = [
+                (text, [uid])
+                for uid in selected_uids
+                for text, _variant in candidate_texts.get(uid, [])
+            ]
+            other_candidates = sorted(set(all_candidates) - set(repeated))
+            method_note = "Fallback OCR recovered; verify before saving"
+            if other_candidates:
+                method_note += (
+                    "; other one-pass candidate(s): " + ", ".join(other_candidates)
+                )
+        elif len(all_candidates) == 1:
+            # A single fallback candidate is useful, but should be visually verified.
+            selected_uids = all_candidates
+            selected_texts = [
+                (text, [uid])
+                for uid in selected_uids
+                for text, _variant in candidate_texts.get(uid, [])
+            ]
+            method_note = "Fallback OCR single-pass candidate; verify before saving"
+        else:
+            # Do not silently pick one when retry variants disagree.
+            return [], "Ambiguous fallback candidates: " + ", ".join(all_candidates)
+
+    # Use text from the pass that detected each selected UID to associate nearby names.
+    rows, seen = [], set()
+    for uid in selected_uids:
+        if uid in seen:
+            continue
+        seen.add(uid)
+        relevant_text = next(
+            (
+                text
+                for text, _uids in selected_texts
+                if uid in find_uid_candidates(text)
+            ),
+            primary_text,
+        )
+        lines = [line.strip() for line in relevant_text.splitlines() if line.strip()]
+        matching_index = next(
+            (
+                index
+                for index, line in enumerate(lines)
+                if uid in find_uid_candidates(line)
+            ),
+            None,
+        )
+        player_name = ""
+        if matching_index is not None:
+            for neighbor in (
+                matching_index - 1,
+                matching_index + 1,
+                matching_index - 2,
+                matching_index + 2,
+            ):
+                if 0 <= neighbor < len(lines) and looks_like_name(lines[neighbor]):
+                    player_name = re.sub(r"\s+", " ", lines[neighbor]).strip()
+                    break
+        rows.append({"Name": player_name, "UID": uid, "Source": source})
+    return rows, method_note
 
 def looks_like_name(line):
     cleaned = re.sub(r"\s+", " ", line).strip(" |:：#-—")
@@ -135,16 +266,21 @@ def process_upload(upload):
                 pixmap = page.get_pixmap(matrix=fitz.Matrix(2.3, 2.3), alpha=False)
                 page_png = pixmap.tobytes("png")
                 image = Image.open(io.BytesIO(page_png))
-                page_rows = extract_image(image, source)
+                page_rows, ocr_note = extract_image(image, source)
                 results.extend(page_rows)
                 found = ", ".join(row["UID"] for row in page_rows)
                 report.append({
                     "File / page": source,
-                    "Result": f"Found {len(page_rows)} UID(s)" if page_rows else "No 8-digit UID detected",
+                    "Result": (
+                        f"Found {len(page_rows)} UID(s) — {ocr_note}"
+                        if page_rows
+                        else ocr_note
+                    ),
                     "UIDs found": found,
                 })
                 if not page_rows:
-                    issue_files[source] = (f"{base_name}_page_{page_index + 1:03d}_no_uid.png", page_png)
+                    issue_suffix = "ambiguous" if ocr_note.startswith("Ambiguous fallback") else "no_uid"
+                    issue_files[source] = (f"{base_name}_page_{page_index + 1:03d}_{issue_suffix}.png", page_png)
             except Exception as exc:
                 report.append({
                     "File / page": source,
@@ -160,11 +296,15 @@ def process_upload(upload):
         source = upload.name
         try:
             image = Image.open(io.BytesIO(data))
-            rows = extract_image(image, source)
+            rows, ocr_note = extract_image(image, source)
             results.extend(rows)
             report.append({
                 "File / page": source,
-                "Result": f"Found {len(rows)} UID(s)" if rows else "No 8-digit UID detected",
+                "Result": (
+                    f"Found {len(rows)} UID(s) — {ocr_note}"
+                    if rows
+                    else ocr_note
+                ),
                 "UIDs found": ", ".join(row["UID"] for row in rows),
             })
             if not rows:
@@ -301,6 +441,8 @@ if uploads and st.session_state.ocr_file_report is not None:
     no_uid_rows = [
         row for row in report_data
         if row["Result"] == "No 8-digit UID detected"
+        or row["Result"].startswith("No UID detected after fallback")
+        or row["Result"].startswith("Ambiguous fallback candidates")
         or row["Result"].startswith("OCR error")
         or row["Result"].startswith("Could not")
         or row["Result"].startswith("Not processed")
@@ -471,6 +613,7 @@ if uploads and st.session_state.review_data is not None:
 
 st.divider()
 st.caption(
-    "The Google Sheet stores only Name and UID. The upload report shows duplicate UIDs and files/pages "
-    "where no 8-digit UID was detected or OCR failed. Review OCR results carefully."
+    "The Google Sheet stores only Name and UID. Pages that fail the first OCR pass are retried with "
+    "sharpened, high-contrast, thresholded, inverted, and digits-only Tesseract passes. Fallback detections "
+    "are flagged for visual review; pages with conflicting candidates are not added automatically."
 )
