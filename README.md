@@ -6,8 +6,10 @@ Public Streamlit app for extracting player names and 8-digit UIDs from game prof
 
 - Public upload page; no Google sign-in required
 - Automatic OCR after selecting image or PDF files
+- Automatic fallback retries on missed UIDs using sharpened, high-contrast, thresholded, inverted, and digits-only Tesseract passes
+- Fallback detections are labelled for visual verification; conflicting fallback candidates are held back and included in the problem-files ZIP
 - Per-file/per-page OCR report, including images/pages where no 8-digit UID was detected or OCR failed
-- Download the specific no-UID/OCR-error images and PDF pages as `uid_ocr_issues.zip`
+- Download no-UID, ambiguous-fallback, and OCR-error images/pages as `uid_ocr_issues.zip`
   - Image files are included in their original format.
   - Problematic pages in PDFs are exported as individual PNG files, not full PDFs when page rendering succeeded.
 - Duplicate summary showing total repeated occurrences, repeated UID values, and source images/PDF pages for each repeated UID
@@ -43,7 +45,7 @@ See `.streamlit/secrets.example.toml` for the format.
 - Each uploaded image is reported as a separate file.
 - PDFs are reported page by page.
 - Repeated UIDs are counted as duplicate occurrences beyond the first detection. The report lists the UID, where it was first found, and the additional image/page locations.
-- The OCR report lists each file/page where no 8-digit UID was detected or processing failed. The ZIP download below that table contains only those reported source items. Problematic PDF pages are exported separately as PNG images, allowing only the affected pages to be downloaded.
+- If the first OCR pass finds no UID, the app retries with multiple image-preprocessing variants and Tesseract page-segmentation modes. A fallback detection is clearly flagged for visual verification before submission. If retries disagree and cannot establish a reliable candidate, the app does not add a UID from that page; it marks the page as ambiguous and includes it in the issue ZIP. The ZIP also contains pages where all retries found no UID or OCR processing failed. Problematic PDF pages are exported separately as PNG images.
 - “No 8-digit UID detected” does not prove OCR itself failed; the image may lack a UID or the image quality/layout may make it unreadable.
 - OCR can misread decorative usernames and digits, so review and correct names/UIDs before submitting.
 
