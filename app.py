@@ -2,6 +2,7 @@ import hashlib
 import io
 import json
 import re
+import zipfile
 from collections import defaultdict
 
 import fitz
@@ -101,28 +102,39 @@ def extract_image(image, source):
 
 
 def process_upload(upload):
-    """Return all UID detections and a per-image/page OCR report."""
+    """Return UID detections, per-page OCR statuses, and downloadable artifacts for problematic pages."""
     data = upload.getvalue()
-    results, report = [], []
+    results, report, issue_files = [], [], {}
 
     if upload.name.lower().endswith(".pdf"):
         try:
             document = fitz.open(stream=data, filetype="pdf")
         except Exception as exc:
-            return [], [{"File / page": upload.name, "Result": f"Could not open PDF: {exc}", "UIDs found": ""}]
+            report.append({
+                "File / page": upload.name,
+                "Result": f"Could not open PDF: {exc}",
+                "UIDs found": "",
+            })
+            issue_files[upload.name] = (upload.name, data)
+            return results, report, issue_files
 
         if document.page_count > 40:
-            return [], [{
+            report.append({
                 "File / page": upload.name,
                 "Result": "Not processed: PDF has more than 40 pages. Split into smaller PDFs.",
                 "UIDs found": "",
-            }]
+            })
+            issue_files[upload.name] = (upload.name, data)
+            return results, report, issue_files
 
+        base_name = upload.name.rsplit(".", 1)[0]
         for page_index, page in enumerate(document):
             source = f"{upload.name} — page {page_index + 1}"
+            page_png = None
             try:
                 pixmap = page.get_pixmap(matrix=fitz.Matrix(2.3, 2.3), alpha=False)
-                image = Image.open(io.BytesIO(pixmap.tobytes("png")))
+                page_png = pixmap.tobytes("png")
+                image = Image.open(io.BytesIO(page_png))
                 page_rows = extract_image(image, source)
                 results.extend(page_rows)
                 found = ", ".join(row["UID"] for row in page_rows)
@@ -131,12 +143,19 @@ def process_upload(upload):
                     "Result": f"Found {len(page_rows)} UID(s)" if page_rows else "No 8-digit UID detected",
                     "UIDs found": found,
                 })
+                if not page_rows:
+                    issue_files[source] = (f"{base_name}_page_{page_index + 1:03d}_no_uid.png", page_png)
             except Exception as exc:
                 report.append({
                     "File / page": source,
                     "Result": f"OCR error: {exc}",
                     "UIDs found": "",
                 })
+                if page_png:
+                    issue_files[source] = (f"{base_name}_page_{page_index + 1:03d}_ocr_error.png", page_png)
+                else:
+                    # If the page cannot be rendered, preserve the original PDF for inspection.
+                    issue_files[source] = (upload.name, data)
     else:
         source = upload.name
         try:
@@ -148,14 +167,39 @@ def process_upload(upload):
                 "Result": f"Found {len(rows)} UID(s)" if rows else "No 8-digit UID detected",
                 "UIDs found": ", ".join(row["UID"] for row in rows),
             })
+            if not rows:
+                issue_files[source] = (upload.name, data)
         except Exception as exc:
             report.append({
                 "File / page": source,
                 "Result": f"Could not read/OCR image: {exc}",
                 "UIDs found": "",
             })
+            issue_files[source] = (upload.name, data)
 
-    return results, report
+    return results, report, issue_files
+
+
+def build_issue_zip(issue_rows, issue_files):
+    """Create a ZIP containing only the images/files listed in the no-UID or OCR-error report."""
+    buffer = io.BytesIO()
+    written = 0
+    with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for index, row in enumerate(issue_rows, start=1):
+            source = row.get("File / page", "")
+            artifact = issue_files.get(source)
+            if not artifact:
+                continue
+            filename, file_bytes = artifact
+            safe_filename = re.sub(r"[^A-Za-z0-9._-]+", "_", filename).strip("._")
+            if not safe_filename:
+                safe_filename = f"ocr_issue_{index}.bin"
+            archive.writestr(f"{index:03d}_{safe_filename}", file_bytes)
+            written += 1
+    if written == 0:
+        return None
+    buffer.seek(0)
+    return buffer.getvalue()
 
 
 st.subheader("1. Upload screenshots or PDFs")
@@ -174,6 +218,7 @@ for key, initial in (
     ("ocr_file_report", None),
     ("duplicate_report", None),
     ("uid_sources", None),
+    ("ocr_issue_files", None),
 ):
     if key not in st.session_state:
         st.session_state[key] = initial
@@ -191,15 +236,17 @@ elif st.session_state.processed_signature is not None:
     st.session_state.ocr_file_report = None
     st.session_state.duplicate_report = None
     st.session_state.uid_sources = None
+    st.session_state.ocr_issue_files = None
 
 # OCR automatically when the selected upload set changes.
 if uploads and current_signature != st.session_state.processed_signature:
-    all_detections, file_report = [], []
+    all_detections, file_report, issue_files = [], [], {}
     with st.spinner("Reading images and PDF pages..."):
         for upload in uploads:
-            detections, per_file_report = process_upload(upload)
+            detections, per_file_report, per_file_issues = process_upload(upload)
             all_detections.extend(detections)
             file_report.extend(per_file_report)
+            issue_files.update(per_file_issues)
 
     # Track all source locations before deduplicating rows for the review table.
     sources_by_uid = defaultdict(list)
@@ -226,6 +273,7 @@ if uploads and current_signature != st.session_state.processed_signature:
         list(first_row_by_uid.values()), columns=["Name", "UID"]
     )
     st.session_state.ocr_file_report = file_report
+    st.session_state.ocr_issue_files = issue_files
     st.session_state.duplicate_report = {
         "items": duplicate_report,
         "duplicate_occurrences": duplicate_occurrences,
@@ -279,6 +327,19 @@ if uploads and st.session_state.ocr_file_report is not None:
     if no_uid_rows:
         with st.expander("See files/pages where OCR found no UID or failed", expanded=True):
             st.dataframe(pd.DataFrame(no_uid_rows), use_container_width=True, hide_index=True)
+
+        issue_zip = build_issue_zip(no_uid_rows, st.session_state.ocr_issue_files or {})
+        if issue_zip:
+            st.download_button(
+                "Download these files/pages as ZIP",
+                data=issue_zip,
+                file_name="uid_ocr_issues.zip",
+                mime="application/zip",
+                help="Contains only the files or individual PDF pages listed in the no-UID/OCR-error table.",
+                key="download_ocr_issues_zip",
+            )
+        else:
+            st.info("No downloadable source files were retained for these report rows.")
 
 if uploads and st.session_state.review_data is not None:
     st.subheader("3. Review all unique extracted entries")
