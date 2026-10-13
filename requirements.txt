@@ -6,3 +6,6 @@ pytesseract
 PyMuPDF
 gspread
 google-auth
+rapidocr>=3.10.0,<4
+onnxruntime>=1.17.0,<2
+
